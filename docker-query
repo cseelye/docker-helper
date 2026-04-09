@@ -11,7 +11,7 @@ PLUGIN_METADATA = {
     "SchemaVersion": "0.1.0",
     "Vendor": "cseelye",
     "Version": "0.1.0",
-    "ShortDescription": "Query images and containers",
+    "ShortDescription": "Query images, containers, and volumes",
     "URL": "",
 }
 
