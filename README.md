@@ -1,2 +1,2 @@
 # docker-helper
-Scripts to make docker command line easier
+Small plugins to make docker CLI easier

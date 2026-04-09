@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Docker CLI plugins must:
+#   1. Be named docker-<name> and placed in ~/.docker/cli-plugins/
+#   2. Respond to the "docker-cli-plugin-metadata" subcommand with JSON
+#   3. Be executable
+
+PLUGIN_NAME="ip"
+PLUGIN_VERSION="0.1.0"
+
+metadata() {
+    cat <<EOF
+{
+    "SchemaVersion": "0.1.0",
+    "Vendor":        "cseelye",
+    "Version":       "${PLUGIN_VERSION}",
+    "ShortDescription": "Show IP addresses of running containers",
+    "URL":           ""
+}
+EOF
+}
+
+usage() {
+    cat <<EOF
+Usage: docker ip [OPTIONS] [CONTAINER...]
+
+Show IP addresses of running containers.
+
+Options:
+  -n, --network NAME   Filter by network name
+  -h, --help           Show this help
+
+Arguments:
+  CONTAINER            One or more container names or IDs (default: all running)
+
+Examples:
+  docker ip                    # all running containers
+  docker ip mycontainer        # specific container
+  docker ip -n mynet           # containers on a specific network
+EOF
+}
+
+cmd_ip() {
+    local network=""
+    local containers=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--network) network="$2"; shift 2 ;;
+            -h|--help)    usage; exit 0 ;;
+            -*)           echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+            *)            containers+=("$1"); shift ;;
+        esac
+    done
+
+    # Build the list of containers to inspect
+    if [[ ${#containers[@]} -eq 0 ]]; then
+        while IFS= read -r line; do containers+=("$line"); done < <(docker ps --format '{{.Names}}')
+        if [[ ${#containers[@]} -eq 0 ]]; then
+            echo "No running containers."
+            exit 0
+        fi
+    fi
+
+    printf "%-30s %-20s %s\n" "CONTAINER" "NETWORK" "IP"
+    printf "%-30s %-20s %s\n" "---------" "-------" "--"
+
+    for container in "${containers[@]}"; do
+        # Get all networks and their IPs for this container
+        while IFS=$'\t' read -r net ip; do
+            [[ -n "$network" && "$net" != "$network" ]] && continue
+            printf "%-30s %-20s %s\n" "$container" "$net" "$ip"
+        done < <(docker inspect "$container" \
+            --format '{{range $net, $cfg := .NetworkSettings.Networks}}{{$net}}{{"\t"}}{{$cfg.IPAddress}}{{"\n"}}{{end}}' \
+            2>/dev/null || echo -e "unknown\t(not found)")
+    done
+}
+
+# First argument is always the plugin subcommand name (e.g. "ip") when called
+# by the Docker CLI, or "docker-cli-plugin-metadata" for metadata queries.
+case "${1:-}" in
+    docker-cli-plugin-metadata) metadata ;;
+    ip)                         shift; cmd_ip "$@" ;;
+    *)                          usage; exit 1 ;;
+esac

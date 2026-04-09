@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Docker CLI plugin: docker cleanup — interactively remove images, containers, and volumes."""
+
+import json
+import subprocess
+import sys
+import termios
+import tty
+from datetime import datetime, timezone
+
+
+PLUGIN_METADATA = {
+    "SchemaVersion": "0.1.0",
+    "Vendor": "cseelye",
+    "Version": "0.1.0",
+    "ShortDescription": "Interactively remove images, containers, and volumes",
+    "URL": "",
+}
+
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+RED    = "\033[31m"
+YELLOW = "\033[33m"
+CYAN   = "\033[36m"
+DIM    = "\033[2m"
+
+STOP_TIMEOUT = 10  # seconds to wait for graceful stop before kill
+
+
+def docker(*args):
+    result = subprocess.run(["docker", *args], capture_output=True, text=True, check=True)
+    return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def format_date(created_at_str):
+    try:
+        dt_utc = datetime.strptime(created_at_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return dt_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return created_at_str
+
+
+def read_single_key():
+    """Read one keypress from the terminal without requiring Enter."""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return ch
+
+
+def prompt(label):
+    """Prompt the user: y=delete, n=skip, q=quit. Returns 'y', 'n', or 'q'."""
+    while True:
+        try:
+            sys.stdout.write(f"  Delete {label}? {BOLD}[y/n/q]{RESET} ")
+            sys.stdout.flush()
+            ch = read_single_key()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return "q"
+        if ch in ("\x03", "\x04"):  # Ctrl-C, Ctrl-D
+            print()
+            return "q"
+        ch = ch.lower()
+        print(ch)  # echo the character
+        if ch in ("y", "n", "q"):
+            return ch
+        print("  Please enter y, n, or q.")
+
+
+def get_containers_for_image(img_id):
+    """Return (running, stopped) lists of (cid, name) tuples for all containers using this image."""
+    try:
+        rows = docker("container", "ls", "--format", "{{json .}}", "--no-trunc", "--all")
+    except subprocess.CalledProcessError:
+        return [], []
+    running = []
+    stopped = []
+    for ctr in rows:
+        cid = ctr.get("ID", "")
+        try:
+            image_id = subprocess.run(
+                ["docker", "inspect", "--format", "{{.Image}}", cid],
+                capture_output=True, text=True, check=True
+            ).stdout.strip()
+        except subprocess.CalledProcessError:
+            continue
+        if image_id == img_id:
+            entry = (cid, ctr.get("Names", cid[:14]))
+            if ctr.get("Status", "").lower().startswith("up"):
+                running.append(entry)
+            else:
+                stopped.append(entry)
+    return running, stopped
+
+
+def stop_and_remove_container(cid, name):
+    """Gracefully stop a container with timeout, then kill if needed, then remove."""
+    print(f"    Stopping {name}...", end=" ", flush=True)
+    try:
+        subprocess.run(
+            ["docker", "container", "stop", f"--time={STOP_TIMEOUT}", cid],
+            capture_output=True, check=True
+        )
+        print("stopped.")
+    except subprocess.CalledProcessError:
+        print(f"timed out, killing...", end=" ", flush=True)
+        try:
+            subprocess.run(["docker", "container", "kill", cid], capture_output=True, check=True)
+            print("killed.")
+        except subprocess.CalledProcessError as e:
+            print(f"{RED}kill failed: {e.stderr.strip()}{RESET}")
+            return False
+    try:
+        subprocess.run(["docker", "container", "rm", cid], capture_output=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"    {RED}Error removing {name}: {e.stderr.strip()}{RESET}")
+        return False
+    return True
+
+
+def cleanup_images(force=False):
+    """Interactively remove images."""
+    print(f"\n{BOLD}{CYAN}=== Images ==={RESET}")
+    try:
+        rows = docker("image", "ls", "--format", "{{json .}}", "--no-trunc", "--all")
+    except subprocess.CalledProcessError as e:
+        print(f"Error listing images: {e.stderr.strip()}", file=sys.stderr)
+        return False
+
+    if not rows:
+        print("  No images found.")
+        return True
+
+    # Automatically remove dangling (untagged) images without prompting
+    dangling = [r for r in rows if r.get("Repository") == "<none>" and r.get("Tag") == "<none>"]
+    named = [r for r in rows if not (r.get("Repository") == "<none>" and r.get("Tag") == "<none>")]
+    if dangling:
+        print(f"\n  Auto-removing {len(dangling)} dangling image(s)...")
+        auto_deleted = auto_errors = 0
+        for img in dangling:
+            img_id = img.get("ID", "")
+            short_id = img_id[7:21] if img_id.startswith("sha256:") else img_id[:14]
+            try:
+                subprocess.run(["docker", "image", "rm", "--force", img_id],
+                               capture_output=True, check=True)
+                print(f"  {RED}Deleted{RESET} {DIM}{short_id}{RESET}")
+                auto_deleted += 1
+            except subprocess.CalledProcessError as e:
+                print(f"  {RED}Error deleting {short_id}: {e.stderr.strip()}{RESET}")
+                auto_errors += 1
+        print(f"  Dangling: {RED}{auto_deleted} deleted{RESET}" +
+              (f", {RED}{auto_errors} errors{RESET}" if auto_errors else ""))
+
+    # Deduplicate named images by ID (multiple tags share the same image)
+    seen_ids = set()
+    unique_rows = []
+    for row in named:
+        img_id = row.get("ID", "")
+        if img_id not in seen_ids:
+            seen_ids.add(img_id)
+            unique_rows.append(row)
+
+    deleted = skipped = 0
+    for img in unique_rows:
+        img_id = img.get("ID", "")
+        repo = img.get("Repository", "<none>")
+        tag = img.get("Tag", "<none>")
+        size = img.get("Size", "")
+        created = format_date(img.get("CreatedAt", ""))
+        name = f"{repo}:{tag}" if repo != "<none>" else img_id[:14]
+
+        running, stopped = get_containers_for_image(img_id)
+
+        if running and not force:
+            ctr_names = ", ".join(n for _, n in running)
+            print(f"\n  {BOLD}{name}{RESET}  {DIM}size={size}  created={created}{RESET}")
+            print(f"  {YELLOW}Skipped — has running containers: {ctr_names}{RESET}")
+            skipped += 1
+            continue
+
+        print(f"\n  {BOLD}{name}{RESET}  {DIM}size={size}  created={created}{RESET}")
+        if running:
+            ctr_names = ", ".join(n for _, n in running)
+            print(f"  {YELLOW}Warning: running containers will be stopped and removed: {ctr_names}{RESET}")
+        if stopped:
+            ctr_names = ", ".join(n for _, n in stopped)
+            print(f"  {DIM}Stopped containers will be removed: {ctr_names}{RESET}")
+
+        answer = prompt(name)
+        if answer == "q":
+            print("  Aborted.")
+            return False
+        if answer == "y":
+            # Stop and remove running containers first
+            ok = True
+            for cid, ctr_name in running:
+                if not stop_and_remove_container(cid, ctr_name):
+                    ok = False
+                    break
+            if not ok:
+                print(f"  {RED}Skipped image deletion due to container error.{RESET}")
+                skipped += 1
+                continue
+            # Remove stopped containers
+            for cid, ctr_name in stopped:
+                try:
+                    subprocess.run(["docker", "container", "rm", cid],
+                                   capture_output=True, check=True)
+                    print(f"  Removed stopped container {ctr_name}.")
+                except subprocess.CalledProcessError as e:
+                    print(f"  {RED}Error removing {ctr_name}: {e.stderr.strip()}{RESET}")
+            try:
+                subprocess.run(["docker", "image", "rm", "--force", img_id],
+                               capture_output=True, check=True)
+                print(f"  {RED}Deleted.{RESET}")
+                deleted += 1
+            except subprocess.CalledProcessError as e:
+                print(f"  Error: {e.stderr.strip()}", file=sys.stderr)
+        else:
+            print(f"  {DIM}Skipped.{RESET}")
+            skipped += 1
+
+    print(f"\n  Images: {RED}{deleted} deleted{RESET}, {DIM}{skipped} skipped{RESET}")
+    return True
+
+
+def cleanup_containers(force=False):
+    """Interactively remove containers."""
+    print(f"\n{BOLD}{CYAN}=== Containers ==={RESET}")
+    try:
+        rows = docker("container", "ls", "--format", "{{json .}}", "--no-trunc", "--all")
+    except subprocess.CalledProcessError as e:
+        print(f"Error listing containers: {e.stderr.strip()}", file=sys.stderr)
+        return False
+
+    if not rows:
+        print("  No containers found.")
+        return True
+
+    deleted = skipped = 0
+    for ctr in rows:
+        cid = ctr.get("ID", "")
+        name = ctr.get("Names", cid[:14])
+        image = ctr.get("Image", "")
+        if image.startswith("sha256:"):
+            image = image[7:21]  # no name available, show short SHA
+        status = ctr.get("Status", "")
+        created = format_date(ctr.get("CreatedAt", ""))
+        running = status.lower().startswith("up")
+        status_color = YELLOW if running else DIM
+        print(f"\n  {BOLD}{name}{RESET}  {DIM}image={image}  created={created}  {RESET}{status_color}status={status}{RESET}")
+
+        answer = prompt(name)
+        if answer == "q":
+            print("  Aborted.")
+            return False
+        if answer == "y":
+            if running:
+                if not stop_and_remove_container(cid, name):
+                    skipped += 1
+                    continue
+                print(f"  {RED}Deleted.{RESET}")
+                deleted += 1
+            else:
+                try:
+                    subprocess.run(["docker", "container", "rm", "--force", cid],
+                                   capture_output=True, check=True)
+                    print(f"  {RED}Deleted.{RESET}")
+                    deleted += 1
+                except subprocess.CalledProcessError as e:
+                    print(f"  Error: {e.stderr.strip()}", file=sys.stderr)
+        else:
+            print(f"  {DIM}Skipped.{RESET}")
+            skipped += 1
+
+    print(f"\n  Containers: {RED}{deleted} deleted{RESET}, {DIM}{skipped} skipped{RESET}")
+    return True
+
+
+def cleanup_volumes(force=False):
+    """Interactively remove volumes."""
+    print(f"\n{BOLD}{CYAN}=== Volumes ==={RESET}")
+    try:
+        rows = docker("volume", "ls", "--format", "{{json .}}")
+    except subprocess.CalledProcessError as e:
+        print(f"Error listing volumes: {e.stderr.strip()}", file=sys.stderr)
+        return False
+
+    if not rows:
+        print("  No volumes found.")
+        return True
+
+    deleted = skipped = 0
+    for vol in rows:
+        name = vol.get("Name", "")
+        driver = vol.get("Driver", "")
+        scope = vol.get("Scope", "")
+        print(f"\n  {BOLD}{name}{RESET}  {DIM}driver={driver}  scope={scope}{RESET}")
+
+        answer = prompt(name)
+        if answer == "q":
+            print("  Aborted.")
+            return False
+        if answer == "y":
+            try:
+                subprocess.run(["docker", "volume", "rm", "--force", name],
+                               capture_output=True, check=True)
+                print(f"  {RED}Deleted.{RESET}")
+                deleted += 1
+            except subprocess.CalledProcessError as e:
+                print(f"  Error: {e.stderr.strip()}", file=sys.stderr)
+        else:
+            print(f"  {DIM}Skipped.{RESET}")
+            skipped += 1
+
+    print(f"\n  Volumes: {RED}{deleted} deleted{RESET}, {DIM}{skipped} skipped{RESET}")
+    return True
+
+
+CLEANUP_TYPES = {
+    "images":     cleanup_images,
+    "containers": cleanup_containers,
+    "volumes":    cleanup_volumes,
+}
+
+
+def usage(to=sys.stdout):
+    print("Usage: docker cleanup [OPTIONS] TYPE\n", file=to)
+    print("Interactively remove Docker resources one by one.\n", file=to)
+    print("Types:", file=to)
+    print("  images       Prompt to remove each local image", file=to)
+    print("  containers   Prompt to remove each container", file=to)
+    print("  volumes      Prompt to remove each volume", file=to)
+    print("  all          Prompt through images, containers, and volumes", file=to)
+    print("\nOptions:", file=to)
+    print("  -f, --force  For images: stop and remove running containers before deleting", file=to)
+    print("               Without this flag, images with running containers are skipped", file=to)
+    print("\nAt each prompt: y=delete  n=skip  q=quit", file=to)
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] == "docker-cli-plugin-metadata":
+        if not args:
+            usage(sys.stderr)
+            sys.exit(1)
+        print(json.dumps(PLUGIN_METADATA, indent=2))
+        return
+
+    if args[0] == "cleanup":
+        args = args[1:]
+
+    if not args or args[0] in ("-h", "--help"):
+        usage()
+        return
+
+    force = "-f" in args or "--force" in args
+    args = [a for a in args if a not in ("-f", "--force")]
+
+    if not args:
+        usage(sys.stderr)
+        sys.exit(1)
+
+    target = args[0].lower()
+
+    if target == "all":
+        for fn in CLEANUP_TYPES.values():
+            if not fn(force=force):
+                break
+    elif target in CLEANUP_TYPES:
+        CLEANUP_TYPES[target](force=force)
+    else:
+        print(f"Unknown type: {target}\n", file=sys.stderr)
+        usage(sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

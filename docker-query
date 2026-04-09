@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""Docker CLI plugin: docker query — list images and containers."""
+
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+
+PLUGIN_METADATA = {
+    "SchemaVersion": "0.1.0",
+    "Vendor": "cseelye",
+    "Version": "0.1.0",
+    "ShortDescription": "Query images and containers",
+    "URL": "",
+}
+
+
+def docker(*args):
+    """Run a docker command and return parsed JSON output (newline-delimited)."""
+    result = subprocess.run(
+        ["docker", *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def docker_raw(*args):
+    """Run a docker command and return stdout as a string."""
+    result = subprocess.run(
+        ["docker", *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def format_date(created_at_str):
+    """Parse Docker's 'YYYY-MM-DD HH:MM:SS +0000 UTC' and return local time."""
+    try:
+        dt_utc = datetime.strptime(created_at_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return dt_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return created_at_str
+
+
+def parse_datetime(created_at_str):
+    """Return a datetime for sorting; falls back to epoch on failure."""
+    try:
+        return datetime.strptime(created_at_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+
+
+def parse_args(args, valid_sort_fields):
+    """Parse common options: -a/--all, -s/--sort, -A/--asc."""
+    show_all = False
+    sort_field = valid_sort_fields[0]
+    ascending = False
+    remaining = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-a", "--all"):
+            show_all = True
+        elif arg in ("-s", "--sort"):
+            i += 1
+            if i >= len(args):
+                print("Error: --sort requires a field name", file=sys.stderr)
+                sys.exit(1)
+            sort_field = args[i].lower()
+            if sort_field not in valid_sort_fields:
+                print(f"Error: unknown sort field '{sort_field}'. Valid fields: {', '.join(valid_sort_fields)}", file=sys.stderr)
+                sys.exit(1)
+        elif arg in ("-A", "--asc"):
+            ascending = True
+        elif arg in ("-h", "--help"):
+            remaining.append(arg)
+        else:
+            remaining.append(arg)
+        i += 1
+    return show_all, sort_field, ascending, remaining
+
+
+def get_image_layers(img_id):
+    """Return the layer list for an image, or [] on failure."""
+    try:
+        raw = docker_raw("inspect", "--format", "{{json .RootFS.Layers}}", img_id)
+        return json.loads(raw) or []
+    except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError):
+        return []
+
+
+def build_parent_map(all_rows):
+    """Return a dict of img_id -> parent_label for all images.
+
+    The parent is the locally known image whose layer list is the longest
+    strict prefix of this image's layer list. If no local parent is found,
+    the value is an empty string.
+    """
+    # Collect all unique IDs including --all images so we can find parents
+    # even if the parent is an intermediate/untagged image.
+    try:
+        all_image_rows = docker("image", "ls", "--format", "{{json .}}", "--no-trunc", "--all")
+    except subprocess.CalledProcessError:
+        all_image_rows = all_rows
+
+    # Map each ID to its best display label (prefer tagged over <none>)
+    id_to_label = {}
+    for row in all_image_rows:
+        img_id = row.get("ID", "")
+        repo = row.get("Repository", "<none>")
+        tag = row.get("Tag", "<none>")
+        label = f"{repo}:{tag}"
+        # Prefer a real tag over <none>:<none>
+        existing = id_to_label.get(img_id, "<none>:<none>")
+        if existing == "<none>:<none>" or label != "<none>:<none>":
+            id_to_label[img_id] = label
+
+    # Fetch layers for every unique ID
+    id_to_layers = {img_id: get_image_layers(img_id) for img_id in id_to_label}
+
+    # For each image, find the direct parent
+    sorted_ids = sorted(id_to_layers, key=lambda x: len(id_to_layers[x]))
+    id_to_parent = {}
+    for img_id in sorted_ids:
+        layers = id_to_layers[img_id]
+        best_parent = None
+        best_len = 0
+        for other_id in sorted_ids:
+            if other_id == img_id:
+                continue
+            other_layers = id_to_layers[other_id]
+            n = len(other_layers)
+            if n == 0 or n >= len(layers):
+                continue
+            if layers[:n] == other_layers and n > best_len:
+                best_parent = other_id
+                best_len = n
+        if best_parent:
+            label = id_to_label.get(best_parent, "")
+            if label == "<none>:<none>":
+                short_id = best_parent[7:21] if best_parent.startswith("sha256:") else best_parent[:14]
+                label = f"<none> [{short_id}]"
+            id_to_parent[img_id] = label
+        else:
+            id_to_parent[img_id] = ""
+
+    return id_to_parent
+
+
+def build_container_map():
+    """Return a dict of full image ID -> list of running container names."""
+    try:
+        rows = docker("container", "ls", "--format", "{{json .}}", "--no-trunc")
+    except subprocess.CalledProcessError:
+        return {}
+    result = {}
+    for ctr in rows:
+        # ImageID from 'container ls' is the full sha256 ID of the image
+        img_id = ctr.get("ID", "")  # container ID, not image ID
+        # We need the image ID, not the container ID — re-inspect isn't needed
+        # because 'container ls' includes Image (name) but not ImageID directly.
+        # Use the Image field to match against our image rows instead.
+        image_ref = ctr.get("Image", "")
+        name = ctr.get("Names", "")
+        result.setdefault(image_ref, []).append(name)
+    return result
+
+
+def cmd_images(args):
+    """List local images."""
+    valid_sort = ("created", "name", "repository", "tag", "size")
+    show_all, sort_field, ascending, remaining = parse_args(args, valid_sort)
+    long_view = "-l" in remaining or "--long" in remaining
+
+    docker_args = ["image", "ls", "--format", "{{json .}}", "--no-trunc"]
+    if show_all:
+        docker_args.append("--all")
+
+    try:
+        rows = docker(*docker_args)
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    if not rows:
+        print("No images found.")
+        return
+
+    # Build container map (needed by both views)
+    try:
+        ctr_rows = docker("container", "ls", "--format", "{{json .}}", "--no-trunc", "--all")
+    except subprocess.CalledProcessError:
+        ctr_rows = []
+
+    img_id_to_containers = {}
+    for ctr in ctr_rows:
+        cid = ctr.get("ID", "")
+        name = ctr.get("Names", "")
+        try:
+            img_id = docker_raw("inspect", "--format", "{{.Image}}", cid)
+        except subprocess.CalledProcessError:
+            continue
+        img_id_to_containers.setdefault(img_id, []).append(name)
+
+    sort_key = {
+        "created":    lambda r: parse_datetime(r.get("CreatedAt", "")),
+        "name":       lambda r: (r.get("Repository", "") + ":" + r.get("Tag", "")).lower(),
+        "repository": lambda r: r.get("Repository", "").lower(),
+        "tag":        lambda r: r.get("Tag", "").lower(),
+        "size":       lambda r: r.get("Size", ""),
+    }[sort_field]
+
+    rows.sort(key=sort_key, reverse=not ascending)
+
+    if long_view:
+        parent_map = build_parent_map(rows)
+        fmt = "{:<45}  {:<20}  {:<14}  {:>8}  {:<19}  {:<25}  {}"
+        print(fmt.format("REPOSITORY", "TAG", "IMAGE ID", "SIZE", "CREATED", "CONTAINERS", "DEPENDS ON"))
+        print(fmt.format("-" * 45, "-" * 20, "-" * 14, "-" * 8, "-" * 19, "-" * 25, "-" * 20))
+        for img in rows:
+            img_id = img.get("ID", "")
+            repo = img.get("Repository", "<none>")
+            tag = img.get("Tag", "<none>")
+            size = img.get("Size", "")
+            created = format_date(img.get("CreatedAt", ""))
+            depends = parent_map.get(img_id, "")
+            containers = ", ".join(sorted(img_id_to_containers.get(img_id, [])))
+            print(fmt.format(repo[:45], tag[:20], img_id[:14], size, created, containers[:25], depends))
+    else:
+        fmt = "{:<67}  {:<14}  {:>8}  {:<19}  {}"
+        print(fmt.format("NAME", "IMAGE ID", "SIZE", "CREATED", "CONTAINERS"))
+        print(fmt.format("-" * 67, "-" * 14, "-" * 8, "-" * 19, "-" * 25))
+        for img in rows:
+            img_id = img.get("ID", "")
+            repo = img.get("Repository", "<none>")
+            tag = img.get("Tag", "<none>")
+            name = f"{repo}:{tag}"
+            size = img.get("Size", "")
+            created = format_date(img.get("CreatedAt", ""))
+            containers = ", ".join(sorted(img_id_to_containers.get(img_id, [])))
+            print(fmt.format(name[:67], img_id[:14], size, created, containers))
+
+
+def cmd_containers(args):
+    """List containers."""
+    valid_sort = ("created", "name", "image", "status")
+    _, sort_field, ascending, remaining = parse_args(args, valid_sort)
+    running_only = "-r" in remaining or "--running" in remaining
+
+    # Default includes stopped containers; -r/--running filters to running only
+    docker_args = ["container", "ls", "--format", "{{json .}}", "--no-trunc"]
+    if not running_only:
+        docker_args.append("--all")
+
+    try:
+        rows = docker(*docker_args)
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    if not rows:
+        print("No running containers." if running_only else "No containers found.")
+        return
+
+    sort_key = {
+        "created": lambda r: parse_datetime(r.get("CreatedAt", "")),
+        "name":    lambda r: r.get("Names", "").lower(),
+        "image":   lambda r: r.get("Image", "").lower(),
+        "status":  lambda r: r.get("Status", "").lower(),
+    }[sort_field]
+
+    rows.sort(key=sort_key, reverse=not ascending)
+
+    fmt = "{:<20}  {:<14}  {:<30}  {:<12}  {}"
+    print(fmt.format("NAME", "CONTAINER ID", "IMAGE", "STATUS", "CREATED"))
+    print(fmt.format("-" * 20, "-" * 14, "-" * 30, "-" * 12, "-" * 19))
+    for ctr in rows:
+        cid = ctr.get("ID", "")[:14]
+        image = ctr.get("Image", "")[:30]
+        name = ctr.get("Names", "")[:20]
+        status = ctr.get("Status", "")[:12]
+        created = format_date(ctr.get("CreatedAt", ""))
+        print(fmt.format(name, cid, image, status, created))
+
+
+def inspect_volume(name):
+    """Return parsed inspect data for a volume, or {} on failure."""
+    try:
+        raw = docker_raw("volume", "inspect", "--format", "{{json .}}", name)
+        return json.loads(raw)
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return {}
+
+
+def format_volume_date(iso_str):
+    """Parse volume inspect's RFC3339 timestamp and return local time."""
+    try:
+        # e.g. "2026-04-09T17:10:45-04:00"
+        dt = datetime.fromisoformat(iso_str)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return iso_str
+
+
+def cmd_volumes(args):
+    """List volumes."""
+    valid_sort = ("created", "name", "driver", "size")
+    _, sort_field, ascending, _ = parse_args(args, valid_sort)
+
+    try:
+        rows = docker("volume", "ls", "--format", "{{json .}}")
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    if not rows:
+        print("No volumes found.")
+        return
+
+    # Enrich each row with inspect data
+    enriched = []
+    for vol in rows:
+        name = vol.get("Name", "")
+        info = inspect_volume(name)
+        enriched.append({
+            "Name":       name,
+            "Driver":     info.get("Driver", vol.get("Driver", "")),
+            "Scope":      info.get("Scope", vol.get("Scope", "")),
+            "Mountpoint": info.get("Mountpoint", vol.get("Mountpoint", "")),
+            "CreatedAt":  info.get("CreatedAt", ""),
+            "Labels":     info.get("Labels") or {},
+            "Options":    info.get("Options") or {},
+        })
+
+    sort_key = {
+        "created": lambda r: r.get("CreatedAt", ""),
+        "name":    lambda r: r.get("Name", "").lower(),
+        "driver":  lambda r: r.get("Driver", "").lower(),
+        "size":    lambda r: r.get("Name", "").lower(),  # size not available, fall back to name
+    }[sort_field]
+
+    enriched.sort(key=sort_key, reverse=not ascending)
+
+    fmt = "{:<40}  {:<10}  {:<19}  {}"
+    print(fmt.format("NAME", "DRIVER", "CREATED", "MOUNTPOINT"))
+    print(fmt.format("-" * 40, "-" * 10, "-" * 19, "-" * 30))
+    for vol in enriched:
+        name       = vol["Name"][:40]
+        driver     = vol["Driver"][:10]
+        created    = format_volume_date(vol["CreatedAt"]) if vol["CreatedAt"] else ""
+        mountpoint = vol["Mountpoint"]
+        print(fmt.format(name, driver, created, mountpoint))
+
+
+SUBCOMMANDS = {
+    "images":     (cmd_images,     "List local images",               ("created", "name", "repository", "tag", "size")),
+    "containers": (cmd_containers, "List containers (all by default)", ("created", "name", "image", "status")),
+    "volumes":    (cmd_volumes,    "List volumes",                     ("created", "name", "driver")),
+}
+
+
+def usage(to=sys.stdout):
+    print("Usage: docker query COMMAND [OPTIONS]\n", file=to)
+    print("Query Docker images and containers.\n", file=to)
+    print("Commands:", file=to)
+    for name, (_, desc, _fields) in SUBCOMMANDS.items():
+        print(f"  {name:<12} {desc}", file=to)
+    print("\nRun 'docker query COMMAND --help' for command-specific options.", file=to)
+
+
+def subcmd_usage(name, desc, sort_fields, extra_options=None):
+    print(f"Usage: docker query {name} [OPTIONS]\n")
+    print(f"{desc}\n")
+    print("Options:")
+    options = [
+        ("-s, --sort FIELD",     f"Sort by field: {', '.join(sort_fields)} (default: {sort_fields[0]})"),
+        ("-A, --asc",            "Sort ascending (default: descending)"),
+        ("-h, --help",           "Show this help"),
+    ]
+    if extra_options:
+        options = extra_options + options
+    for flag, fdesc in options:
+        print(f"  {flag:<22} {fdesc}")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] == "docker-cli-plugin-metadata":
+        if not args:
+            usage(sys.stderr)
+            sys.exit(1)
+        print(json.dumps(PLUGIN_METADATA, indent=2))
+        return
+
+    # Docker CLI passes the plugin name as the first argument
+    if args[0] == "query":
+        args = args[1:]
+
+    if not args or args[0] in ("-h", "--help"):
+        usage()
+        return
+
+    subcmd = args[0]
+    subcmd_args = args[1:]
+
+    if subcmd not in SUBCOMMANDS:
+        print(f"Unknown command: {subcmd}\n", file=sys.stderr)
+        usage(sys.stderr)
+        sys.exit(1)
+
+    if "--help" in subcmd_args or "-h" in subcmd_args:
+        fn, desc, sort_fields = SUBCOMMANDS[subcmd]
+        extra = None
+        if subcmd == "images":
+            extra = [
+                ("-a, --all",   "Include intermediate/untagged images"),
+                ("-l, --long",  "Long view: separate REPOSITORY/TAG columns, DEPENDS ON"),
+            ]
+        elif subcmd == "containers":
+            extra = [("-r, --running", "Show only running containers (default: all)")]
+        subcmd_usage(subcmd, desc, sort_fields, extra)
+        return
+
+    fn, _, _ = SUBCOMMANDS[subcmd]
+    fn(subcmd_args)
+
+
+if __name__ == "__main__":
+    main()
