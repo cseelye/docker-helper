@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_DIR="${DOCKER_HELPER_SOURCE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+if [[ -n ${DOCKER_CLI_PLUGIN_DIR:-} ]]; then
+    PLUGIN_DIR="$DOCKER_CLI_PLUGIN_DIR"
+else
+    PLUGIN_DIR="${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins"
+fi
+REMOVE=0
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: docker-helper-link [OPTIONS]
+
+Create or remove Docker CLI-plugin links for the helpers in plugins.txt.
+
+Options:
+  --source DIR       Directory containing plugins.txt and helper executables
+  --plugin-dir DIR   Docker CLI-plugin directory
+  --remove           Remove links owned by this Docker-helper installation
+  -h, --help         Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --source)
+            [[ $# -ge 2 ]] || die "--source requires a directory."
+            SOURCE_DIR="$2"
+            shift 2
+            ;;
+        --plugin-dir)
+            [[ $# -ge 2 ]] || die "--plugin-dir requires a directory."
+            PLUGIN_DIR="$2"
+            shift 2
+            ;;
+        --remove)
+            REMOVE=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "Unknown option: $1"
+            ;;
+    esac
+done
+
+SOURCE_DIR="$(cd "$SOURCE_DIR" 2>/dev/null && pwd)" || \
+    die "Source directory not found: $SOURCE_DIR"
+MANIFEST="$SOURCE_DIR/plugins.txt"
+[[ -f "$MANIFEST" ]] || die "Plugin manifest not found: $MANIFEST"
+
+plugins=()
+while IFS= read -r plugin || [[ -n "$plugin" ]]; do
+    case "$plugin" in
+        ''|'#'*) continue ;;
+    esac
+
+    case "$plugin" in
+        docker-*) ;;
+        *) die "Invalid plugin name in manifest: $plugin" ;;
+    esac
+    [[ "$plugin" != *[!A-Za-z0-9._-]* ]] || \
+        die "Invalid plugin name in manifest: $plugin"
+
+    plugin_path="$SOURCE_DIR/$plugin"
+    if [[ "$REMOVE" -eq 0 ]]; then
+        [[ -f "$plugin_path" ]] || die "Plugin not found: $plugin_path"
+        [[ -x "$plugin_path" ]] || die "Plugin is not executable: $plugin_path"
+    fi
+    plugins+=("$plugin")
+done < "$MANIFEST"
+
+[[ ${#plugins[@]} -gt 0 ]] || die "Plugin manifest is empty: $MANIFEST"
+
+if [[ "$REMOVE" -eq 1 ]]; then
+    for plugin in "${plugins[@]}"; do
+        link_path="$PLUGIN_DIR/$plugin"
+        expected_target="$SOURCE_DIR/$plugin"
+        if [[ -L "$link_path" && "$(readlink "$link_path")" == "$expected_target" ]]; then
+            rm "$link_path"
+            echo "    Removed $link_path"
+        fi
+    done
+    echo "==> Docker helper plugin links removed."
+    exit 0
+fi
+
+mkdir -p "$PLUGIN_DIR"
+for plugin in "${plugins[@]}"; do
+    plugin_path="$SOURCE_DIR/$plugin"
+    link_path="$PLUGIN_DIR/$plugin"
+
+    if [[ -d "$link_path" && ! -L "$link_path" ]]; then
+        die "Cannot replace plugin directory: $link_path"
+    fi
+
+    ln -sfn "$plugin_path" "$link_path"
+    echo "    Linked $link_path -> $plugin_path"
+done
+
+echo "==> Docker helper plugins linked."

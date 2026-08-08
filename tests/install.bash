@@ -3,12 +3,14 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/docker-helper-test.XXXXXX")"
+TEST_DIR="$(cd "$TEST_DIR" && pwd)"
 REMOTE_DIR="$TEST_DIR/remote.git"
 SOURCE_DIR="$TEST_DIR/source"
 INSTALL_DIR="$TEST_DIR/install"
 PLUGIN_DIR="$TEST_DIR/cli-plugins"
 UNRELATED_TARGET="$TEST_DIR/orbstack/docker-compose"
 UNRELATED_BUILDX_TARGET="$TEST_DIR/orbstack/docker-buildx"
+FOREIGN_CLEANUP_TARGET="$TEST_DIR/foreign/docker-cleanup"
 
 cleanup() {
     rm -rf "$TEST_DIR"
@@ -29,10 +31,13 @@ assert_link_target() {
 }
 
 mkdir -p "$SOURCE_DIR" "$(dirname "$UNRELATED_TARGET")" "$PLUGIN_DIR"
-cp "$PROJECT_DIR/install.sh" "$PROJECT_DIR/plugins.txt" \
+mkdir -p "$(dirname "$FOREIGN_CLEANUP_TARGET")"
+cp "$PROJECT_DIR/install.sh" "$PROJECT_DIR/docker-helper-link" \
+    "$PROJECT_DIR/plugins.txt" \
     "$PROJECT_DIR/docker-cleanup" "$PROJECT_DIR/docker-ip" \
     "$PROJECT_DIR/docker-query" "$SOURCE_DIR/"
-chmod +x "$SOURCE_DIR/install.sh" "$SOURCE_DIR/docker-cleanup" \
+chmod +x "$SOURCE_DIR/install.sh" "$SOURCE_DIR/docker-helper-link" \
+    "$SOURCE_DIR/docker-cleanup" \
     "$SOURCE_DIR/docker-ip" "$SOURCE_DIR/docker-query"
 
 git init --bare "$REMOTE_DIR" >/dev/null
@@ -64,6 +69,22 @@ done
 assert_link_target "$PLUGIN_DIR/docker-compose" "$UNRELATED_TARGET"
 assert_link_target "$PLUGIN_DIR/docker-buildx" "$UNRELATED_BUILDX_TARGET"
 
+DOCKER_CLI_PLUGIN_DIR="$PLUGIN_DIR" \
+    "$INSTALL_DIR/docker-helper-link" --source "$INSTALL_DIR" --remove >/dev/null
+for plugin in docker-cleanup docker-ip docker-query; do
+    [[ ! -e "$PLUGIN_DIR/$plugin" && ! -L "$PLUGIN_DIR/$plugin" ]] || \
+        fail "$plugin link was not removed"
+done
+assert_link_target "$PLUGIN_DIR/docker-compose" "$UNRELATED_TARGET"
+assert_link_target "$PLUGIN_DIR/docker-buildx" "$UNRELATED_BUILDX_TARGET"
+
+touch "$FOREIGN_CLEANUP_TARGET"
+ln -s "$FOREIGN_CLEANUP_TARGET" "$PLUGIN_DIR/docker-cleanup"
+DOCKER_CLI_PLUGIN_DIR="$PLUGIN_DIR" \
+    "$INSTALL_DIR/docker-helper-link" --source "$INSTALL_DIR" --remove >/dev/null
+assert_link_target "$PLUGIN_DIR/docker-cleanup" "$FOREIGN_CLEANUP_TARGET"
+run_installer
+
 if command -v docker >/dev/null; then
     for command_name in cleanup ip query; do
         DOCKER_CONFIG="$TEST_DIR" docker "$command_name" --help >/dev/null 2>&1 || \
@@ -94,4 +115,4 @@ fi
 assert_link_target "$PLUGIN_DIR/docker-compose" "$UNRELATED_TARGET"
 assert_link_target "$PLUGIN_DIR/docker-buildx" "$UNRELATED_BUILDX_TARGET"
 
-echo "PASS: installer clones, updates, repeats, validates, and preserves unrelated plugins"
+echo "PASS: installer clones, updates, links, unlinks, validates, and preserves unrelated plugins"
