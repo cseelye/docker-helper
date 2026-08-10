@@ -91,11 +91,12 @@ brew style Formula/docker-helper.rb
 brew audit --formula cseelye/tap/docker-helper
 ```
 
-On a disposable macOS system, install from the updated tap with the system-link
-option:
+On a disposable macOS system, install from the updated tap, then create the
+system links outside Homebrew's post-install sandbox:
 
 ```sh
-brew install cseelye/tap/docker-helper --with-system-links
+brew install cseelye/tap/docker-helper
+docker-helper-link --system
 ```
 
 Verify each manifest entry is a link into the formula's `opt_libexec`:
@@ -114,7 +115,8 @@ or upgrade when the release changes installation behavior:
 ```sh
 brew test cseelye/tap/docker-helper
 docker-helper-link --system --remove
-brew reinstall cseelye/tap/docker-helper --with-system-links
+brew reinstall cseelye/tap/docker-helper
+docker-helper-link --system
 ```
 
 After validation, commit and push the formula update.
