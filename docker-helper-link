@@ -8,6 +8,8 @@ else
     PLUGIN_DIR="${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins"
 fi
 REMOVE=0
+SYSTEM=0
+PLUGIN_DIR_OPTION=0
 
 die() {
     echo "Error: $*" >&2
@@ -23,6 +25,7 @@ Create or remove Docker CLI-plugin links for the helpers in plugins.txt.
 Options:
   --source DIR       Directory containing plugins.txt and helper executables
   --plugin-dir DIR   Docker CLI-plugin directory
+  --system           Use /usr/local/lib/docker/cli-plugins with sudo
   --remove           Remove links owned by this Docker-helper installation
   -h, --help         Show this help
 EOF
@@ -38,7 +41,12 @@ while [[ $# -gt 0 ]]; do
         --plugin-dir)
             [[ $# -ge 2 ]] || die "--plugin-dir requires a directory."
             PLUGIN_DIR="$2"
+            PLUGIN_DIR_OPTION=1
             shift 2
+            ;;
+        --system)
+            SYSTEM=1
+            shift
             ;;
         --remove)
             REMOVE=1
@@ -53,6 +61,22 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$SYSTEM" -eq 1 ]]; then
+    [[ "$PLUGIN_DIR_OPTION" -eq 0 ]] || \
+        die "--system cannot be combined with --plugin-dir."
+    PLUGIN_DIR="/usr/local/lib/docker/cli-plugins"
+fi
+
+run_mutation() {
+    if [[ "$SYSTEM" -eq 1 && "$EUID" -ne 0 ]]; then
+        command -v sudo >/dev/null 2>&1 || \
+            die "sudo is required when using --system."
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
 
 SOURCE_DIR="$(cd "$SOURCE_DIR" 2>/dev/null && pwd)" || \
     die "Source directory not found: $SOURCE_DIR"
@@ -87,7 +111,7 @@ if [[ "$REMOVE" -eq 1 ]]; then
         link_path="$PLUGIN_DIR/$plugin"
         expected_target="$SOURCE_DIR/$plugin"
         if [[ -L "$link_path" && "$(readlink "$link_path")" == "$expected_target" ]]; then
-            rm "$link_path"
+            run_mutation rm "$link_path"
             echo "    Removed $link_path"
         fi
     done
@@ -95,7 +119,7 @@ if [[ "$REMOVE" -eq 1 ]]; then
     exit 0
 fi
 
-mkdir -p "$PLUGIN_DIR"
+run_mutation mkdir -p "$PLUGIN_DIR"
 for plugin in "${plugins[@]}"; do
     plugin_path="$SOURCE_DIR/$plugin"
     link_path="$PLUGIN_DIR/$plugin"
@@ -104,7 +128,7 @@ for plugin in "${plugins[@]}"; do
         die "Cannot replace plugin directory: $link_path"
     fi
 
-    ln -sfn "$plugin_path" "$link_path"
+    run_mutation ln -sfn "$plugin_path" "$link_path"
     echo "    Linked $link_path -> $plugin_path"
 done
 

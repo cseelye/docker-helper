@@ -9,6 +9,14 @@ brew install cseelye/tap/docker-helper
 docker-helper-link
 ```
 
+To install the links system-wide instead, opt in during installation. The
+linker will use `sudo` for the filesystem changes and may prompt for your
+password:
+
+```sh
+brew install cseelye/tap/docker-helper --with-system-links
+```
+
 Homebrew installs the helpers from a versioned release. `docker-helper-link`
 links the plugins listed in `plugins.txt` into the Docker CLI-plugin directory.
 To remove only those links before uninstalling the formula, run:
@@ -17,6 +25,18 @@ To remove only those links before uninstalling the formula, run:
 docker-helper-link --remove
 brew uninstall docker-helper
 ```
+
+Remove system-wide links with:
+
+```sh
+docker-helper-link --system --remove
+brew uninstall docker-helper
+```
+
+Why two separate commands? Docker searches for CLI plugins in `~/.docker/cli-plugins`, but Homebrew
+deliberately isolates formula installation from the user home directory. The
+system-wide directory `/usr/local/lib/docker/cli-plugins` avoids that problem,
+but requires administrator access for changes.
 
 ## Install from Git
 
@@ -40,7 +60,9 @@ installations:
 The standalone `docker-helper-link` command can also link or remove the
 manifest entries without cloning or updating a repository. It uses
 `${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins` unless `--plugin-dir` or
-`DOCKER_CLI_PLUGIN_DIR` overrides the destination.
+`DOCKER_CLI_PLUGIN_DIR` overrides the destination. Pass `--system` to use
+`/usr/local/lib/docker/cli-plugins`; the linker adds `sudo` only to filesystem
+changes that require it.
 
 Run the installer test with:
 

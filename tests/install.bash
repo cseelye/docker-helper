@@ -11,6 +11,8 @@ PLUGIN_DIR="$TEST_DIR/cli-plugins"
 UNRELATED_TARGET="$TEST_DIR/orbstack/docker-compose"
 UNRELATED_BUILDX_TARGET="$TEST_DIR/orbstack/docker-buildx"
 FOREIGN_CLEANUP_TARGET="$TEST_DIR/foreign/docker-cleanup"
+FAKE_BIN="$TEST_DIR/fake-bin"
+SUDO_LOG="$TEST_DIR/sudo.log"
 
 cleanup() {
     rm -rf "$TEST_DIR"
@@ -39,6 +41,13 @@ cp "$PROJECT_DIR/install.sh" "$PROJECT_DIR/docker-helper-link" \
 chmod +x "$SOURCE_DIR/install.sh" "$SOURCE_DIR/docker-helper-link" \
     "$SOURCE_DIR/docker-cleanup" \
     "$SOURCE_DIR/docker-ip" "$SOURCE_DIR/docker-query"
+
+mkdir -p "$FAKE_BIN"
+cat > "$FAKE_BIN/sudo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SUDO_LOG"
+EOF
+chmod +x "$FAKE_BIN/sudo"
 
 git init --bare "$REMOTE_DIR" >/dev/null
 git -C "$SOURCE_DIR" init >/dev/null
@@ -96,6 +105,24 @@ run_installer
 assert_link_target "$PLUGIN_DIR/docker-compose" "$UNRELATED_TARGET"
 assert_link_target "$PLUGIN_DIR/docker-buildx" "$UNRELATED_BUILDX_TARGET"
 
+if [[ "$EUID" -ne 0 ]]; then
+    PATH="$FAKE_BIN:$PATH" SUDO_LOG="$SUDO_LOG" \
+        "$INSTALL_DIR/docker-helper-link" --source "$INSTALL_DIR" \
+        --system >/dev/null
+    grep -Fxq 'mkdir -p /usr/local/lib/docker/cli-plugins' "$SUDO_LOG" || \
+        fail "--system did not use sudo to create the plugin directory"
+    for plugin in docker-cleanup docker-ip docker-query; do
+        grep -Fxq \
+            "ln -sfn $INSTALL_DIR/$plugin /usr/local/lib/docker/cli-plugins/$plugin" \
+            "$SUDO_LOG" || fail "--system did not use sudo to link $plugin"
+    done
+fi
+
+if "$INSTALL_DIR/docker-helper-link" --source "$INSTALL_DIR" --system \
+    --plugin-dir "$PLUGIN_DIR" >/dev/null 2>&1; then
+    fail "linker accepted --system with --plugin-dir"
+fi
+
 printf '\n# update marker\n' >> "$SOURCE_DIR/docker-ip"
 git -C "$SOURCE_DIR" add docker-ip
 git -C "$SOURCE_DIR" commit -m "update test fixture" >/dev/null
@@ -115,4 +142,4 @@ fi
 assert_link_target "$PLUGIN_DIR/docker-compose" "$UNRELATED_TARGET"
 assert_link_target "$PLUGIN_DIR/docker-buildx" "$UNRELATED_BUILDX_TARGET"
 
-echo "PASS: installer clones, updates, links, unlinks, validates, and preserves unrelated plugins"
+echo "PASS: installer clones, updates, links, unlinks, validates, supports system links, and preserves unrelated plugins"
